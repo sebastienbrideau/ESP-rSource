@@ -164,8 +164,13 @@ C     this let to an unbearable computing time in copy routine.
 C     the routine now applies the computed flux to the linked zone structure too, so a radiant floor affects not only the 
 C     actual zone but also the linked zone.
       SUBROUTINE RadFloor_CoeffGen(IPCOMP,COUT,ISTATS)
+      use h3kmodule
 #include "plant.h"
 #include "building.h"
+
+C External functions------------------------------------------------
+      integer lnblnk
+C ------------------------------------------------------------------ 
 
       COMMON/OUTIN/IUOUT,IUIN
       COMMON/TC/ITC,ICNT
@@ -195,6 +200,10 @@ C     actual zone but also the linked zone.
       COMMON/PCRES/QDATA(MPCOM),PCAOUT(MPCOM,MPCRES),NAPDAT(MPCOM)
       REAL QDATA,PCAOUT
       INTEGER napdat
+      
+C Plant component ASCII names.
+      common/pcnam/pcname(mpcom)
+      character*15 pcname        ! Plant component names      
 
 C     building construction common block data
       COMMON/C6/INDCFG
@@ -211,20 +220,52 @@ C     surface and nodal temperatures of zones
 C     Generic nodal flux common - allows a flux to be added or subtracted from a node.
       COMMON/GENFLUX/GENFLXF(MCOM,MS,MN),GENFLXP(MCOM,MS,MN)
 
+C     Common block for zone heat transfer coefficients
+      COMMON/CONCOE/HCIP(MCOM,MS),HCIF(MCOM,MS),HCOP(MCOM,MS),
+     &              HCOF(MCOM,MS)
+      
+     
+      common/fvala/tfa(mcom),qfa(mcom)  !Zone air temperatures and heat transfers (future)
+      common/SRFBAL/qswrdi(MCOM,MS,2),qlwrdi(MCOM,MS,2),
+     &           qconvi(MCOM,MS,2),qcondi(MCOM,MS,2),qstori(MCOM,MS,2),
+     &           qcri(MCOM,MS,2),qpltri(MCOM,MS,2),qstore(MCOM,MS,2),
+     &           qconde(MCOM,MS,2),qconve(MCOM,MS,2),qlwrde(MCOM,MS,2),
+     &           qlwrbd(MCOM,MS,2),qlwrsk(MCOM,MS,2),qswrde(MCOM,MS,2)
 
 
 C     Parameters and common variables related to this component ----------------------
 C     The common block should also be included in the MZNASS subroutine
 C     (found in ESRUPLT/PMATRX.F)to store present time values of some variables
 
-      PARAMETER (Nmax = 20, ITmax = 100, PI=3.1415926535, PI2=0.5*PI)
-      PARAMETER (Relax = 1.0, Tol = 1.E-6, TolF = 1.E-3, Small = 1.E-15)
+      PARAMETER (Nmax = 20, PI=3.1415926535, PI2=0.5*PI,nNodesMax=100)
+      PARAMETER (Tol = 1.E-6, TolF = 1.E-3, Small = 1.E-15)
       COMMON /RHC/Acof(MPCOM,Nmax,Nmax),Fcof(MPCOM,Nmax,Nmax),
      &     Fcofp(MPCOM,Nmax,Nmax),ConAf(MPCOM),ConBf(MPCOM),
      &     ConDf(MPCOM),ConAp(MPCOM),ConBp(MPCOM),
      &     ConDp(MPCOM), TetaMf(MPCOM), TetaMp(MPCOM),
-     &     Tpipef(MPCOM), Tpipep(MPCOM)
-      REAL    COUT(MPCOE), J11, J12, J21, J22
+     &     Tpipef(MPCOM), Tpipep(MPCOM), Tp(MPCOM,nNodesMax*2),
+     &     Tf(MPCOM,nNodesMax*2)
+      COMMON/COE32S/QSLIF(MCOM,MS),QSLEF(MCOM,MS),QTMCAF(MCOM,MS,MN)
+      REAL    COUT(MPCOE), J11, J12, J21, J22, Relax
+      INTEGER ITmax, ModelFlag, FloorCoverElement, finElement,icount,D
+      INTEGER nNodes
+      
+      
+      !variables for fin model
+      REAL    AvgFinT, finL, pipeOuterD, avgCoverT, hFlrCover
+     & , Tb, FINrho, FINCp, FINt, tao
+      
+      DOUBLE PRECISION, allocatable :: MatrixA(:,:)
+      DOUBLE PRECISION, allocatable :: VectorC(:)
+      DOUBLE PRECISION, allocatable :: VectorT(:)
+      REAL avgFinTFiniteDiff, FINk, COVERCp
+      REAL COVERrho, COVERk, COVERt, hfincover, hCOVER
+      REAL qsolar, deltax, TpipefPIter, qlongwave
+	  
+      INTEGER InsulationLayer
+      REAL ErrCorr      
+      
+c== insertion copied from MM
       
       COMMON/GR1D01/NNDS,NNDZ(MCOM),NNDC(MCOM,MS),NNDL(MCOM,MS,ME)
 
@@ -237,6 +278,10 @@ C logical value to assess if the zone has a coupled zone
       logical bCoupled_Zone
 
       character outs*124
+     
+C Variables used for reporting
+
+      INTEGER iNameLength        ! Used for the reporting
 C----------------------------------------------------------------------
 C     Flag indicating if radiant floor is active, number of radiant floors, indirect index for radiant_floor component
       COMMON/RadFloor/RadFloor_active, NRadFloor, IRadFloor,
@@ -262,6 +307,21 @@ C     Initialize pointers to inter-connection(s) ICON, and node(s) INOD
       INOD1=NPCDAT(IPCOMP,9)
 
 C     variable assignments -----------------------------------------------
+
+C     number of nodes used for finite difference method
+
+      nNodes = ADATA(IPCOMP,13)
+      
+C     Allocate MAtrixA, VectorC and VectorT
+      if (.not.allocated(MatrixA)) 
+     &   allocate ( MatrixA(nNodes*2,nNodes*2) )
+      
+      if (.not.allocated(VectorC)) allocate ( VectorC(nNodes*2) )
+      
+      if (.not.allocated(VectorT)) allocate ( VectorT(nNodes*2) )
+      
+
+
 C     Plant time step
       Dt    = TIMSEC
 C     Inlet fluid temperature
@@ -310,6 +370,35 @@ C     1-D average temperature of the pipe outer surface
 
 C     1-D average temperature of the inside face of the radiant surface
       Tsurf1D = TFS(Iz, Is)
+      
+C     Relaxation factor      
+      Relax = ADATA(IPCOMP,10)
+      
+C     Max Number of iterations for component      
+      ITmax = INT( ADATA(IPCOMP,11) )      
+
+C     Flag for model. 1 = Laouadi Model, 2 = Fin model for pipe in subfloor (e.g. Warmboard)
+      ModelFlag = ADATA(IPCOMP,12)
+      
+      
+C     Insulation Layer
+      InsulationLayer = ADATA(IPCOMP,14)
+
+C     Fin model operations
+      FloorCoverElement = INT((In+2.)/2.)
+      finElement = INT(In/2.)
+      FINrho = THRMLI(Iz,Is,finElement,2)
+      FINCp = THRMLI(Iz,Is,finElement,3)
+      FINk = THRMLI(Iz,Is,finElement,1)
+      FINt = THRMLI(Iz,Is,finElement,4)
+      finL = ADATA(IPCOMP,4)/2
+      pipeOuterD = ADATA(IPCOMP,3)
+      qsolar = QSLIF(Iz,Is) !Absorbed solar
+      qlongwave = qlwrdi(Iz,Is,2)/AreaR !longwave heat transfer rate
+      hFlrCover = HCIF(Iz,Is) !convective heat transfer coefficient
+C     hfincover is the conductive heat transfer coefficient between floor cover and fin 
+      
+      deltax=finL/(nNodes-0.5)
 
 C---------------------------------------------------------------------------------
 C     Calculate the total thickness, average conductivity and volumetric specific heat
@@ -327,8 +416,22 @@ C     and the variable denoting the total thickness of the construction
       THKC    = 0.0
 
 C     This variable denotes the position of the center node of a construction layer
+      IF (ModelFlag .EQ. 1.0) THEN
       Ncentr  = 0
-      DO 11 J = 1, NELTS(Iz,Is)
+      ELSE IF (ModelFlag .EQ. 2.0) THEN
+      Ncentr = 2*NELTS(Iz,Is)
+      END IF
+            
+      COVERrho = 0.0
+      COVERCp = 0.0
+      COVERk = 0.0
+      COVERt = 0.0
+      hCOVER = 0.0
+
+     
+      
+      IF (ModelFlag .EQ. 1.0) THEN
+      DO 11 J = InsulationLayer+1, NELTS(Iz,Is)
 C     Layer conductivity
          COND = THRMLI(Iz,Is,J,1)
 C     Layer density
@@ -339,35 +442,92 @@ C     Layer thickness
          THKL = THRMLI(Iz,Is,J,4)
 
          THKC = THKC + THKL
-
+      
+      
 C     Find the resistance of the air gap associated with layer J.
          IF(NairGap .GT. 0 .AND. THRMLI(Iz,Is,J,1) .LT. Small)THEN
             DO 12 iNairGap =1, NairGap
                IndxAirG = NPGAP(Iz,Is,iNairGap)
                IF(IndxAirG .EQ. J) THEN
-                  Ncentr = Ncentr + 1
+                  Ncentr = Ncentr + 1  
                   AirRes = RGAPS(Iz,Is,iNairGap)
                   COND = THKL/AirRes
                ENDIF
  12         CONTINUE
          ELSE
             Ncentr = Ncentr + 2
-            IF(In .EQ. Ncentr+1) Xqc = THKC
-            IF(In .EQ. Ncentr  ) Xqc = THKC - THKL/2.
-            IF(In .EQ. Ncentr-1) Xqc = THKC - THKL
+            IF(In-(InsulationLayer*2) .EQ. Ncentr+1) Xqc = THKC
+            IF(In-(InsulationLayer*2) .EQ. Ncentr  ) Xqc = THKC - THKL/2.
+            IF(In-(InsulationLayer*2) .EQ. Ncentr-1) Xqc = THKC - THKL
          ENDIF
          AKslab  = AKslab  + COND*THKL
          RCPslab = RCPslab + DENS*SHT*THKL
+ 
+      
  11   CONTINUE
-
 C     average thermal conductivity, diffusivity and volumetric
 C     specific heat of slab system
       AKslab  = AKslab/THKC
       RCPslab = RCPslab/THKC
       DIFslab = AKslab / RCPslab
 
+
+      
+      ELSE IF (ModelFlag .EQ. 2.0) THEN
+       
+      DO J = FloorCoverElement, NELTS(Iz,Is)
+C     Layer conductivity
+         COND = THRMLI(Iz,Is,J,1)
+C     Layer density
+         DENS = THRMLI(Iz,Is,J,2)
+C     Layer specific heat
+         SHT  = THRMLI(Iz,Is,J,3)
+C     Layer thickness
+         THKL = THRMLI(Iz,Is,J,4)
+
+         COVERt = COVERt + THKL
+
+      IF(NairGap .GT. 0 .AND. THRMLI(Iz,Is,J,1) .LT. Small)THEN
+            DO iNairGap =1, NairGap
+               IndxAirG = NPGAP(Iz,Is,iNairGap)
+               IF(IndxAirG .EQ. J) THEN
+                  
+                  AirRes = RGAPS(Iz,Is,iNairGap)
+                  COND = THKL/AirRes
+               END IF
+            END DO
+            
+     
+      END IF
+      COVERk  = COVERk  + COND*THKL
+      COVERCp = COVERCp + SHT*THKL
+      COVERrho = COVERrho + DENS*THKL
+      
+      IF (hCOVER .EQ. 0.0) THEN
+      hCOVER = (THKL/COND)**(-1.0)
+      ELSE
+      hCOVER = (1/hCOVER + THKL/COND)**(-1.0)
+      END IF
+      
+      END DO
+      COVERk = COVERk/COVERt
+      COVERCp = COVERCp/COVERt
+      COVERrho = COVERrho/COVERt
+      END IF
+      
+      hfincover = (FINt/(2*FINk)+1/hCOVER)**(-1.0)
+
+
 C     Check if the specified injection node is valid -----------------
-      IF(In .LT. 1 .OR. In .GT. Ncentr+1) THEN
+      IF (ModelFlag .EQ. 1.0) THEN
+      
+      ErrCorr=(InsulationLayer*2.0)-1.0
+      ELSE
+      ErrCorr = 0.0
+	  
+      ENDIF
+	  
+      IF(In .LT. 1 .OR. In .GT. Ncentr+1.0+ErrCorr) THEN
          WRITE(outs,*)'CMP95C Fatal error: injection node',In,
      &     ' not in range 1 to',Ncentr+1
          call edisp(iuout,outs)
@@ -394,7 +554,8 @@ C     Size (Dx, Dy, volume) of the heat generation control volume = pipe volume
       DYq   = DXq
       Volq  = 4. * DXq * DYq * CirL
 
-C
+      
+
 C     find the component radiant floor number of component
       irf = IRadFloor(IPCOMP)
 
@@ -434,7 +595,7 @@ C     See the above reports for more details
          ConAf(irf)  = ConAp(irf)
          ConBf(irf)  = ConBp(irf)
          ConDf(irf)  = ConDp(irf)
-
+      IF (ModelFlag .EQ. 1.0) THEN
 C     calculate series coefficients: Aij abd Fij. See the above reports for more details
          DO 10 I = 1, Nmax
             II = I - 1
@@ -450,7 +611,17 @@ C     calculate series coefficients: Aij abd Fij. See the above reports for more
                Fcof(irf,I,J) = 0.
 
  10         CONTINUE
+      END IF
 
+C     Initiate Tp vector for fin model
+      Tf=15.0
+      Tp=15.0
+      
+C     Initiate MatrixA, VectorC, and VectorT
+      MatrixA = 0.0
+      VectorC = 0.0
+      VectorT = 0.0
+ 		
          ENDIF
 
 C----------------------------------------------------------------------
@@ -533,6 +704,10 @@ C     Heat transfer per circuit
 C     Calculate the heat generation rate per pipe volume
                Qsor = Qcir/Volq
 
+C	  If Laouadi model used, solve conduction equations
+      IF (ModelFlag .EQ. 1.0) THEN
+
+               
 C     calculate the serires coefficient Fij, pipe temperature and min and max
 C     inside surface temperatures
                SumTpipe = 0.
@@ -589,7 +764,7 @@ C     Form the djacobien matrix for the Newton-Raphson method
      &                 Dt * (1.-ExpCL)/DEN )
                   J21 = - UA/Volq * SumJacob
                   J22 = 1. - ResI*RCPAp / Dt * J21
-
+                  
                   Delta  = J11*J22 - J12*J21 + Small
                   Delta1 = -F1*J22 + J12*F2
                   Delta2 = -J11*F2 + J21*F1
@@ -603,6 +778,154 @@ C     Check whether or not convergence is reached
 
                   IF( (Error .LT. Tol) .AND. (ErrorF .LT. TolF)) GOTO 50
 
+C	  If fin model is used           
+      ELSE IF (ModelFlag .EQ. 2.0) THEN
+      MatrixA = 0.0
+
+C     setup MatrixA starting with fin element near pipe ---------------
+
+C     First element
+      MatrixA(1,1)=FINk*FINt/deltax+hfincover*deltax/2+
+     &    deltax*FINt*FINrho*FINCp/(2*Dt)
+      MatrixA(1,2)=-FINk*FINt/deltax
+      MatrixA(1,nNodes+1)=-hfincover*deltax/2
+
+C     Middle elements
+      DO icount = 2,nNodes-1
+      
+      MatrixA(icount,icount)=2*FINk*FINt/deltax+hfincover*deltax+
+     &     FINrho*FINCp*FINt*deltax/Dt
+      MatrixA(icount,icount-1)=-FINk*FINt/deltax
+      MatrixA(icount,icount+1)=-FINk*FINt/deltax
+      MatrixA(icount,icount+nNodes)=-hfincover*deltax;
+      
+      END DO
+      
+C     Last element
+      MatrixA(nNodes,nNodes)=FINk*FINt/deltax+hfincover*deltax+
+     &     FINrho*FINCp*FINt*deltax/Dt
+      MatrixA(nNodes,nNodes-1)=-FINk*FINt/deltax
+      MatrixA(nNodes,nNodes+nNodes)=-hfincover*deltax
+      
+C     setup VectorC starting with fin element near pipe
+
+      VectorC(1)=Qcir/(2.0*Cirl)+FINrho*FINCp*Tp(irf,1)
+     &           *FINt*deltax/(2*Dt)
+      
+      DO icount=2,nNodes
+      VectorC(icount)=FINt*FINrho*FINCp*Tp(irf,icount)*deltax/Dt
+      END DO
+     	
+C     End of fin elements setup --------------------------------------- 
+
+C     Setup cover elements starting with element closest to pipe
+
+
+C     1st element (Cover near pipe)
+      MatrixA(nNodes+1,nNodes+1)=COVERk*COVERt/deltax+hfincover*deltax/2
+     &    +hFlrCover*deltax/2+deltax*COVERt*COVERrho*COVERCp/(2*Dt)
+      MatrixA(nNodes+1,nNodes+2)=-COVERk*COVERt/deltax
+      MatrixA(nNodes+1,1)=-hfincover*deltax/2
+
+C     All middle elements      
+      DO icount=2,nNodes-1;
+
+      MatrixA(nNodes+icount,nNodes+icount)=2*COVERk*COVERt/deltax+
+     &  hfincover*deltax+COVERrho*COVERCp*COVERt*deltax/Dt+
+     &  hFlrCover*deltax
+      MatrixA(nNodes+icount,nNodes+icount-1)=-COVERk*COVERt/deltax
+      MatrixA(nNodes+icount,nNodes+icount+1)=-COVERk*COVERt/deltax
+      MatrixA(nNodes+icount,icount)=-hfincover*deltax
+      END DO
+C     Last element
+      MatrixA(2*nNodes,2*nNodes)=COVERk*COVERt/deltax+hfincover*deltax
+     &   +COVERrho*COVERCp*COVERt*deltax/Dt+hFlrCover*deltax
+      MatrixA(2*nNodes,2*nNodes-1)=-COVERk*COVERt/deltax
+      MatrixA(2*nNodes,nNodes)=-hfincover*deltax
+      
+      VectorC(1+nNodes)=qsolar*deltax/2+COVERrho*COVERCp*
+     & Tp(irf,nNodes+1)*COVERt*deltax/(2*Dt)+hFlrCover*tfa(Iz)*deltax/2
+     & +qlongwave*deltax/2
+     
+      DO icount=2,nNodes;
+
+      VectorC(icount+nNodes)=qsolar*deltax+COVERrho*COVERCp
+     & *Tp(irf,icount+nNodes)*COVERt*deltax/Dt+
+     &  hFlrCover*tfa(Iz)*deltax+qlongwave*deltax
+
+      END DO
+
+      
+      CALL JSOLVD(MatrixA,nNodes*2,nNodes*2,VectorT,VectorC)
+
+      
+      AvgFinT = 0
+      DO icount=1,nNodes
+      IF(icount .EQ. 1) THEN
+      AvgFinT =AvgFinT+0.5*VectorT(icount)/(nNodes-0.5)
+      ELSE
+      AvgFinT =AvgFinT+VectorT(icount)/(nNodes-0.5)
+      END IF
+      END DO
+      
+      
+      AvgCoverT = 0
+      DO icount=nNodes+1,2*nNodes
+      IF(icount .EQ. nNodes+1) THEN
+      AvgCoverT=AvgCoverT+0.5*VectorT(icount)/(nNodes-0.5)
+      ELSE
+      AvgCoverT=AvgCoverT+VectorT(icount)/(nNodes-0.5)
+      END IF
+      END DO
+      
+      
+      
+      DO icount=1,nNodes
+      Tf(irf,icount)=VectorT(icount)-(AvgFinT-TFC(Iz,Is,In))
+      END DO
+      
+      DO icount=nNodes+1,2*nNodes
+      Tf(irf,icount)=VectorT(icount)-(AvgCoverT-TFS(Iz,Is))
+      END DO
+      
+      TpipefPIter=Tpipef(irf)
+      Tpipef(irf)=Tpipef(irf)+(Relax*(Tf(irf,1)-Tpipef(irf)))
+          
+      IF (ConAp(irf) .EQ. 0.0) THEN
+      ConAp(irf) = RCPAf / UP
+      END IF
+      TetaMf(irf)= TetaMf(irf)+Relax*( (( ALPHA*ConAp(irf)*ConAf(irf)
+     &                 + ALPHAc* ( ConAp(irf)
+     &                 - ConBp(irf)*Dt ) * (ConAf(irf)
+     &                 + ConBf(irf) * Dt ) ) * TetaMp(irf) +
+     &                 ( ALPHA*ConDf(irf) * ConAp(irf)
+     &                 + ConDp(irf)*ALPHAc *
+     &                 (ConAf(irf) + ConBf(irf) * Dt) ) * Dt)/
+     &        (ConAp(irf) * ( ConAf(irf)+ ConBf(irf)*Dt ))-TetaMf(irf))
+
+      Error = ABS(TpipefPIter-Tpipef(irf))
+      
+          
+
+
+      IF (Error .LT. 0.0001)  GOTO 50
+
+
+      ELSE
+      
+      WRITE(IUOUT,*) ' CMP68S: Model Flag Error ',IPCOMP
+      WRITE(IUOUT,*) '    ',ModelFlag,'     should be 1 or 2'
+      STOP ' RadFloor_CoeffGen: unresolvable error'
+      END IF
+                  
+
+C     Check whether or not convergence is reached
+              
+                
+
+                                    
+
+
  20            CONTINUE
 
  50            CONTINUE
@@ -610,6 +933,9 @@ C     Check whether or not convergence is reached
 C     iteration now terminated --------------------------------------------
 
 C     temperatures and node heat injection flux (W)
+
+          IF (ModelFlag.EQ.1.) THEN
+          
                Ratio = ( (1. + CL)*ExpCL - 1.)/ (CL -1. + ExpCL)
                Tout = Ratio*Tin
      &              + (1. - Ratio)*(TetaMf(irf) + Tpipef(irf) )
@@ -618,6 +944,21 @@ C     temperatures and node heat injection flux (W)
                Qboiler = ADATA(IPCOMP,1) * FLWCp * (Tin - Tout)
                Qnode   = ADATA(IPCOMP,1) * Qcir
                GENFLXF(Iz,Is,In) = Qnode / AreaR
+               
+          ELSE IF (ModelFlag.EQ.2.) THEN
+               Ratio = ( (1. + CL)*ExpCL - 1.)/ (CL -1. + ExpCL)
+               Tout = Ratio*Tin
+     &              + (1. - Ratio)*(TetaMf(irf) + Tpipef(irf) )
+               Tmin = Tf(irf,2*nNodes)
+               Tmax = Tf(irf,nNodes+1)
+               Qboiler = ADATA(IPCOMP,1) * FLWCp * (Tin - Tout)
+               Qnode   = ADATA(IPCOMP,1) * Qcir
+               GENFLXF(Iz,Is,In) = Qnode / AreaR
+             
+         END IF       
+               
+               
+c== insertion copied from MM
 C.....store the same flux for adiacent surface
                if ( bCoupled_Zone( Iz, Is ) ) then
                  Iza = iCoupled_Zone ( Iz, Is)
@@ -626,6 +967,7 @@ C.....store the same flux for adiacent surface
                  GENFLXF(Iza,Isa,Ina) = Qnode / AreaR
                endif
 
+c== end insertion
 C     Establish additional output variables
 C     Minimum inside surface temperature
                PCAOUT(IPCOMP,1) = Tmin
@@ -662,6 +1004,26 @@ C     2nd phase mass (ie. vapour) balance coefficients
                COUT(2)=0.
                COUT(3)=0.
             END IF
+            
+C---------------------------------------------------------------------------------
+C Make select results available in XML and CVS output.
+C---------------------------------------------------------------------------------
+
+         iNameLength = lnblnk(pcname(IPCOMP))
+      
+         call AddToReport(rvpltRadFloorTmin%Identifier,
+     &           Tmin,
+     &           pcname(IPCOMP)(1:iNameLength))  
+         
+         call AddToReport(rvpltRadFloorTmax%Identifier,
+     &           Tmax,
+     &           pcname(IPCOMP)(1:iNameLength))
+     
+         call AddToReport(rvpltRadFloorInj%Identifier,
+     &           Qnode,
+     &           pcname(IPCOMP)(1:iNameLength)) 
+     
+C----------------------------------------------------------------------------------            
 
 C     Trace output
             IF(ITC.GT.0.AND.NSINC.GE.ITC.AND.NSINC.LE.ITCF.AND.
@@ -748,16 +1110,17 @@ C     Flag indicating if radiant floor is active.
      &                InitRadFloor
 
 C     data for storage
-      INTEGER Nmax, Iz, Is, J, I
-      PARAMETER (Nmax = 20)
+      INTEGER Nmax, Iz, Is, J, I, nNodes, icount, nNodesMax
+      PARAMETER (Nmax = 20, nNodesMax=100)
       COMMON /RHC/Acof(MPCOM,Nmax,Nmax),Fcof(MPCOM,Nmax,Nmax),
      &        Fcofp(MPCOM,Nmax,Nmax),ConAf(MPCOM),ConBf(MPCOM),
      &          ConDf(MPCOM),ConAp(MPCOM),ConBp(MPCOM),
      &          ConDp(MPCOM), TetaMf(MPCOM), TetaMp(MPCOM),
-     &          Tpipef(MPCOM), Tpipep(MPCOM)
+     &          Tpipef(MPCOM), Tpipep(MPCOM), Tp(MPCOM,nNodesMax*2),
+     &          Tf(MPCOM,nNodesMax*2)
 
       REAL Acof,Fcof,Fcofp,ConAf,ConBf,ConDf,ConAp,ConBp,ConDp,
-     &     TetaMf, TetaMp,Tpipef, Tpipep
+     &     TetaMf, TetaMp,Tpipef, Tpipep, Tp, Tf
 
 C.....Storage variables
       REAL Fcofp_store(MPCOM,Nmax,Nmax)
@@ -766,9 +1129,11 @@ C.....Storage variables
       REAL ConAp_store(MPCOM)
       REAL ConBp_store(MPCOM)
       REAL ConDp_store(MPCOM)
+      REAL Tp_store(MPCOM,nNodesMax*2)
+      REAL Tf_store(MPCOM,nNodesMax*2)
 
       SAVE Fcofp_store,TetaMp_store,Tpipep_store,ConAp_store,ConBp_store
-      SAVE ConDp_store
+      SAVE ConDp_store, Tp_store, Tf_store
 
 
 C.....Passed variable
@@ -809,7 +1174,25 @@ c            DO Is = 1, ncon
                   enddo
                enddo
 
+               DO icount=1,nNodesMax*2
+               
+                     if (iOperation .eq. iSaving ) then
 
+                        Tp_store(irf,icount) = Tp(irf,icount)
+
+                     elseif ( iOperation .eq. iWinding ) then
+
+                        Tp(irf,icount)  = Tf(irf,icount)
+
+                     elseif ( iOperation .eq. iRewinding ) then
+
+                        Tf(irf,icount)  = Tp(irf,icount)
+                        Tp(irf,icount) = Tp_store(irf,icount)
+                        
+                     ENDIF
+                        
+               
+               ENDDO
 
                if (iOperation .eq. iSaving ) then
 
